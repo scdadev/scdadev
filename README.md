@@ -58,5 +58,9 @@ After downloading and extracting the data, add your dataset directory to the `da
 
 -----
 
+#### Train
+To train the agent:
 
-further complete soon...
+```
+python train.py
+```
