@@ -1,5 +1,6 @@
 ## Getting Started
 our code is basically refered from:
+
 @misc{almuzairee2024recipe,
       title={A Recipe for Unbounded Data Augmentation in Visual Reinforcement Learning}, 
       author={Abdulaziz Almuzairee and Nicklas Hansen and Henrik I. Christensen},
