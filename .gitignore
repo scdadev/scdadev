@@ -1,0 +1,19 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+__pycache__/
+
+# Repo Specific
+snapshots/
+screen_out/
+snapshot.pt
+wandb/
+buffer/
+train.log
+logs/
+datasets/
+
+*.yaml
+*.png
+*.mp4
