@@ -291,7 +291,7 @@ class AGENT:
 
                 if 'attmask' in self.strong_aug[0] or 'all' == self.strong_aug[0]:
                     _obs = obs - obs.mean(dim=0)
-                    mask = utils.compute_attribution_mask(_obs, quantile=0.94).long()
+                    mask = utils.compute_attribution_mask(_obs, quantile=0.95).long()
                     aug_obs = self.apply_strong_aug(obs.clone(), mask=mask)
                 else: 
                     aug_obs = self.apply_strong_aug(obs.clone())
@@ -325,7 +325,7 @@ class AGENT:
 
         if 'attmask' in self.strong_aug[0] or 'all' == self.strong_aug[0]:
             _obs = obs - obs.mean(dim=0)
-            mask = utils.compute_attribution_mask(_obs, quantile=0.94).long()
+            mask = utils.compute_attribution_mask(_obs, quantile=0.95).long()
             aug_obs = self.apply_strong_aug(obs.clone(), mask=mask)
         else:
             aug_obs = self.apply_strong_aug(obs.clone())
@@ -339,7 +339,7 @@ class AGENT:
                 loss_gen1 = loss_rebuilt + 0.2*loss_ssim
 
                 emb = self.jug_encoder(aug_obs_gen)
-                loss_gen2 = -torch.trace(torch.cov(emb.T))*0.0001
+                loss_gen2 = -torch.trace(torch.cov(emb.T))*0.001
                 # emb = F.normalize(emb, dim=1)    # ------------ or replace with this
                 # similarity_matrix = emb @ emb.T    # ------------ cos similarity
                 # loss_gen2 = -similarity_matrix.mean()*0.01    # ------------

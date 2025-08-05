@@ -5,13 +5,12 @@ import torch.nn.functional as F
 
 import utils
 import augmentations
+from collections import deque
 
-from copy import deepcopy
-from pytorch_msssim import ssim
-import time
+import matplotlib.pyplot as plt
 
 class Encoder(nn.Module):
-    def __init__(self, obs_shape):
+    def __init__(self, obs_shape, feature_dim):
         super().__init__()
 
         assert len(obs_shape) == 3
@@ -22,6 +21,9 @@ class Encoder(nn.Module):
                                      nn.ReLU(), nn.Conv2d(32, 32, 3, stride=1),
                                      nn.ReLU(), nn.Conv2d(32, 32, 3, stride=1),
                                      nn.ReLU())
+        
+        # self.trunk = nn.Sequential(nn.Linear(self.repr_dim, feature_dim),
+        #                            nn.LayerNorm(feature_dim), nn.Tanh())
 
         self.apply(utils.weight_init)
 
@@ -29,6 +31,7 @@ class Encoder(nn.Module):
         obs = obs / 255.0 - 0.5
         h = self.convnet(obs)
         h = h.view(h.shape[0], -1)
+        # h = self.trunk(h)
         return h
     
 
@@ -58,6 +61,7 @@ class Actor(nn.Module):
     def forward(self, obs):
         h = self.trunk(obs)
         mu, log_std = self.policy(h).chunk(2, dim=-1)
+        # mu, log_std = self.policy(obs).chunk(2, dim=-1)
 
         # constrain log_std inside [log_std_min, log_std_max]
         log_std = torch.tanh(log_std)
@@ -89,9 +93,11 @@ class Critic(nn.Module):
 
         self.apply(utils.weight_init)
 
-    def forward(self, obs, action, step=10, info=None):
+    def forward(self, obs, action):
         h = self.trunk(obs)
         h_action = torch.cat([h, action], dim=-1)
+        # h = self.trunk(obs)
+        # h_action = torch.cat([obs, action], dim=-1)
         q1 = self.Q1(h_action)
         q2 = self.Q2(h_action)
 
@@ -106,16 +112,11 @@ class AGENT:
                  log_std_bounds, strong_augs, spda_para, add_clip, clip_step, clip_para):
 
         self.device = device
-        self.strong_aug = strong_augs
         self.critic_target_tau = critic_target_tau
         self.update_every_steps = update_every_steps
         self.num_expl_steps = num_expl_steps
-        self.lr = lr
-        self.consistency = True
-        self.applytransfer = True
-        self.conventer_pretrain = True
         # models
-        self.encoder = Encoder(obs_shape).to(device)
+        self.encoder = Encoder(obs_shape, feature_dim).to(device)
         self.actor = Actor(self.encoder.repr_dim, action_shape, feature_dim,
                            hidden_dim, log_std_bounds).to(device)
 
@@ -130,24 +131,59 @@ class AGENT:
         # set target entropy to -|A|
         self.target_entropy = -action_shape[0]
 
-        self.auto_converter = utils.Autogenerator().to(device)
-        self.jug_encoder = utils.jug_encoder(deepcopy(self.encoder),deepcopy(self.critic.trunk)).to(device)
-        for param in self.jug_encoder.parameters():
-            param.requires_grad = False
         # optimizers
-        self.encoder_opt = torch.optim.Adam(self.encoder.parameters(), lr=self.lr)
-        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=self.lr)
-        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=self.lr)
-        self.log_alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=self.lr)
-
-        self.AC01_optimizer = torch.optim.Adam(self.auto_converter.parameters(), lr=self.lr)
-        
+        self.encoder_opt = torch.optim.Adam(self.encoder.parameters(), lr=lr)
+        self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=lr)
+        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=lr)
+        self.log_alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=lr)
        # data augmentation
         self.aug = augmentations.random_shift(pad=4)
-        self.apply_strong_aug = augmentations.compose_augs(strong_augs)
+
+        self.apply_strong_aug = augmentations.compose_augs_ucb()
+        self.total_num = 1
+        self.num_aug_types = 4
+        self.total_num = 1
+        self.num_action = [1.] * self.num_aug_types 
+        self.qval_action = [0.] * self.num_aug_types
+        self.ucb_exploration_coef = 0.1
+        self.current_aug_id = 0    # init
+
+        self.expl_action = [0.] * self.num_aug_types 
+        self.ucb_action = [0.] * self.num_aug_types 
+
+        self.return_action = []
+        for i in range(self.num_aug_types):
+            self.return_action.append(deque(maxlen=10))
+
+        self.aug_choose = None
 
         self.train()
         self.critic_target.train()
+
+        self.add_spda = True
+        self.spda_para = spda_para
+        self.add_clip = add_clip
+        self.clip_step = clip_step
+        self.clip_para = clip_para
+
+    def select_ucb_aug(self):
+        for i in range(self.num_aug_types):
+            self.expl_action[i] = self.ucb_exploration_coef * \
+                np.sqrt(np.log(self.total_num) / self.num_action[i])
+            self.ucb_action[i] = self.qval_action[i] + self.expl_action[i]
+        self.current_aug_id = np.argmax(self.ucb_action)
+        return self.current_aug_id
+
+    def update_ucb_values(self, next_obs, reward, discount=0.99):
+        self.total_num += 1
+        self.num_action[self.current_aug_id] += 1
+        with torch.no_grad():
+            dist = self.actor(next_obs)
+            action = dist.rsample()
+            value_estimate = ((discount*self.critic_target(next_obs, action)[0]).mean()+reward.mean()).item()
+        self.return_action[self.current_aug_id].append(value_estimate)
+        self.qval_action[self.current_aug_id] = np.mean(self.return_action[self.current_aug_id]) 
+
 
     def train(self, training=True):
         self.training = training
@@ -174,7 +210,7 @@ class AGENT:
         return action.cpu().detach().numpy()[0]
 
 
-    def update_critic(self, obs, action, reward, discount, next_obs, aug_obs, step, info=None):
+    def update_critic(self, obs, action, reward, discount, next_obs, aug_obs):
         metrics = dict()
         with torch.no_grad():
             dist = self.actor(next_obs)
@@ -189,15 +225,16 @@ class AGENT:
         # get current Q estimates
         combined_obs = torch.cat([obs, aug_obs], dim=0)
         combined_action = torch.cat([action, action], dim=0)
-        combined_target_Q = torch.cat([target_Q, target_Q], dim=0)
 
-        combined_Q1, combined_Q2 = self.critic(combined_obs, combined_action, step=step, info=info)
+        combined_Q1, combined_Q2 = self.critic(combined_obs, combined_action)
         reg_Q1, aug_Q1 = combined_Q1.chunk(2, dim=0)
         reg_Q2, aug_Q2 = combined_Q2.chunk(2, dim=0)
-        reg_Q = torch.cat([reg_Q1, reg_Q2], dim=0)
-        aug_Q = torch.cat([aug_Q1, aug_Q2], dim=0)
-        
-        critic_loss = (F.mse_loss(reg_Q, combined_target_Q) + F.mse_loss(aug_Q, combined_target_Q)) * 0.5
+
+        critic_loss = (F.mse_loss(reg_Q1, target_Q) + F.mse_loss(reg_Q2, target_Q)) \
+                       + (F.mse_loss(aug_Q1, target_Q) + F.mse_loss(aug_Q2, target_Q)) * 0.5
+        # critic_loss = (F.mse_loss(reg_Q1, target_Q) + F.mse_loss(reg_Q2, target_Q)
+        #                + F.mse_loss(aug_Q1, reg_Q1.detach()) + F.mse_loss(aug_Q2, reg_Q2.detach())) * 0.5
+        total_loss = critic_loss
 
         metrics['critic_target_q'] = target_Q.mean().item()
         metrics['reg_critic_q1'] = reg_Q1.mean().item()
@@ -205,11 +242,12 @@ class AGENT:
         metrics['aug_critic_q1'] = aug_Q1.mean().item()
         metrics['aug_critic_q2'] = aug_Q2.mean().item()
         metrics['critic_loss'] = critic_loss.item()
+        # metrics['spda_loss'] = spda_loss.item()
 
         # optimize encoder and critic
         self.encoder_opt.zero_grad(set_to_none=True)
         self.critic_opt.zero_grad(set_to_none=True)
-        critic_loss.backward()
+        total_loss.backward()
         self.critic_opt.step()
         self.encoder_opt.step()
 
@@ -224,18 +262,22 @@ class AGENT:
         reg_aug_obs = torch.cat([obs, aug_obs], dim=0)
 
         dist = self.actor(reg_aug_obs)
+
+        dist_o = self.actor(obs)
+        dist_a = self.actor(aug_obs)
+
         action = dist.rsample()
         log_prob = dist.log_prob(action).sum(-1, keepdim=True)
         Q1, Q2 = self.critic(reg_reg_obs, action)
         Q = torch.min(Q1, Q2)
 
         actor_loss = (self.alpha.detach() * log_prob - Q).mean()
+        actor_loss_2 = F.mse_loss(dist_o.mean, dist_a.mean) * 0.1
 
         # optimize the actor
         self.actor_opt.zero_grad(set_to_none=True)
-        actor_loss.backward()
+        (actor_loss + actor_loss_2).backward()
         self.actor_opt.step()
-
 
         self.log_alpha_optimizer.zero_grad(set_to_none=True)
         alpha_loss = (self.alpha * (-log_prob - self.target_entropy).detach()).mean()
@@ -253,35 +295,6 @@ class AGENT:
 
     # Altering to include strong aug
     def update(self, replay_iter, step, info= None):
-
-        if self.conventer_pretrain and self.applytransfer:    # pretrain the converter
-            print("converter pretrain started")
-            for _ in range(100000):
-                batch = next(replay_iter)
-                obs, _, _, _, _ = utils.to_torch(
-                    batch, self.device)
-                obs = self.aug(obs.float())
-
-                if 'attmask' in self.strong_aug[0] or 'all' == self.strong_aug[0]:
-                    _obs = obs - obs.mean(dim=0)
-                    mask = utils.compute_attribution_mask(_obs, quantile=0.95).long()
-                    aug_obs = self.apply_strong_aug(obs.clone(), mask=mask)
-                else: 
-                    aug_obs = self.apply_strong_aug(obs.clone())
-
-                aug_obs_gen = self.auto_converter(aug_obs)
-                loss_converter_pretrain = F.mse_loss(aug_obs_gen/255.0, aug_obs/255.0)
-                loss_ssim = 1 - ssim(aug_obs_gen/255.0, aug_obs/255.0, data_range=1.0, size_average=True)
-                loss_rebuilt = loss_converter_pretrain + 0.2*loss_ssim
-                # loss_rebuilt = loss_converter_pretrain
-                self.AC01_optimizer.zero_grad()
-                loss_rebuilt.backward()
-                self.AC01_optimizer.step()
-            print("converter pretrain finished")
-
-            self.AC02_optimizer = torch.optim.Adam(self.auto_converter.parameters(), lr=self.lr)
-            self.conventer_pretrain = False
-
         metrics = dict()
 
         if step % self.update_every_steps != 0:
@@ -290,55 +303,32 @@ class AGENT:
         batch = next(replay_iter)
         obs, action, reward, discount, next_obs = utils.to_torch(
             batch, self.device)
-
-        # augment
-        obs = self.aug(obs.float())
+        
+        obs = self.aug(obs.float())    # random_shift
         next_obs = self.aug(next_obs.float())
 
-        if 'attmask' in self.strong_aug[0] or 'all' == self.strong_aug[0]:
-            _obs = obs - obs.mean(dim=0)
-            mask = utils.compute_attribution_mask(_obs, quantile=0.95).long()
-            aug_obs = self.apply_strong_aug(obs.clone(), mask=mask)
-        else:
-            aug_obs = self.apply_strong_aug(obs.clone())
+        with torch.no_grad():
+            next_obs = self.encoder(next_obs)
 
-        if self.consistency:
-            if self.applytransfer:
-                aug_obs_gen = self.auto_converter(aug_obs)
-                loss_rebuilt = F.mse_loss(aug_obs_gen/255.0, aug_obs/255.0)
-                loss_ssim = 1 - ssim(aug_obs_gen/255.0, aug_obs/255.0, data_range=1.0, size_average=True)
-                loss_gen1 = loss_rebuilt + 0.2*loss_ssim
-
-                emb = self.jug_encoder(aug_obs_gen)
-                loss_gen2 = -torch.trace(torch.cov(emb.T))*0.001
-                # emb = F.normalize(emb, dim=1)    # ------------ or replace with this
-                # similarity_matrix = emb @ emb.T    # ------------ cos similarity
-                # loss_gen2 = -similarity_matrix.mean()*0.01    # ------------
-                ratio = 1
-                if abs(loss_gen2)>=2.0*abs(loss_gen1):
-                    with torch.no_grad():
-                        ratio = abs(loss_gen1*2.0/loss_gen2)
-                        loss_gen2 = loss_gen2*ratio
-                loss_gen = loss_gen1+loss_gen2
-                self.AC02_optimizer.zero_grad()
-                loss_gen.backward()
-                self.AC02_optimizer.step()
-
-                choices = torch.rand(aug_obs.shape[0], device=self.device) < 1/2
-                choices_expanded = choices[:, None, None, None]
-                aug_obs_gen = aug_obs_gen.detach()
-                aug_obs = torch.where(choices_expanded, aug_obs, aug_obs_gen)
+        if step > 1000 and step%10==0:
+            self.aug_choose = self.select_ucb_aug()
+            self.update_ucb_values(next_obs,reward,discount=discount)
+        # augment
+        
+        aug_obs = self.apply_strong_aug(obs.clone(),aug_choose=self.aug_choose)    # strong_augs
+        
+        # ===================== show aug_obs =====================
+        # plt.imsave('aug_obs_70.png',np.moveaxis(np.array(aug_obs[70][:3].cpu())/255.01,0,-1))
 
         # encode
         combined_obs = torch.cat([obs, aug_obs], dim=0)
         obs, aug_obs = self.encoder(combined_obs).chunk(2, dim=0)
-        with torch.no_grad():
-            next_obs = self.encoder(next_obs)
+
 
         metrics['batch_reward'] = reward.mean().item()
 
         # update critic
-        metrics.update(self.update_critic(obs, action, reward, discount, next_obs, aug_obs, step=step, info=info))
+        metrics.update(self.update_critic(obs, action, reward, discount, next_obs, aug_obs))
 
         # update actor
         metrics.update(self.update_actor(obs.detach(), aug_obs.detach()))
@@ -346,9 +336,5 @@ class AGENT:
         # update critic target
         utils.soft_update_params(self.critic, self.critic_target,
                                  self.critic_target_tau)
-        
-        if self.applytransfer and step % 2500 == 0:
-            utils.soft_update_params(self.encoder, self.jug_encoder.encoder1, 1)
-            utils.soft_update_params(self.critic.trunk, self.jug_encoder.trunk, 1)
 
         return metrics

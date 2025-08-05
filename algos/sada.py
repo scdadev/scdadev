@@ -258,7 +258,7 @@ class AGENT:
         
         if 'attmask' in self.strong_aug[0] or 'all' == self.strong_aug[0]:
             _obs = obs - obs.mean(dim=0)
-            mask = utils.compute_attribution_mask(_obs, quantile=0.94).long()
+            mask = utils.compute_attribution_mask(_obs, quantile=0.95).long()
             aug_obs = self.apply_strong_aug(obs.clone(), mask=mask)
         else: 
             aug_obs = self.apply_strong_aug(obs.clone())
